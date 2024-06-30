@@ -1952,16 +1952,22 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 // Currently these keys are:
 //   - X-Amz-Server-Side-Encryption-Customer-Key
 //   - X-Amz-Copy-Source-Server-Side-Encryption-Customer-Key
+//
+// 这里实现了 putobject 操作, 在 bucket 中添加一个对象
+// 注意: S3 客户端可以发送加密相关作业的头部中的密钥, 处理程序应确保在将其发送到对象层之前删除这些密钥
 func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "PutObject")
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
+	// 这里是确保获取了一个正确的API, 这里可以跳过
 	objectAPI := api.ObjectAPI()
 	if objectAPI == nil {
+		// 返回的错误是: 客户端没有被初始化
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
 		return
 	}
 
+	// 获取 bucket 以及 object 参数
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 	object, err := unescapePath(vars["object"])
@@ -1984,6 +1990,8 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		}
 	}
 
+	// 获取 Etag
+	// Etag 是一个 MD5 值, 用于校验文件的完整性
 	clientETag, err := etag.FromContentMD5(r.Header)
 	if err != nil {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidDigest), r.URL)
@@ -1992,6 +2000,8 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 
 	// if Content-Length is unknown/missing, deny the request
 	size := r.ContentLength
+
+	// 权限验证相关代码, 暂时跳过
 	rAuthType := getRequestAuthType(r)
 	switch rAuthType {
 	// Check signature types that must have content length
@@ -2008,17 +2018,24 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 			}
 		}
 	}
+
+	// 这里是 put, 上传不能是-1嘞
 	if size == -1 {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrMissingContentLength), r.URL)
 		return
 	}
 
 	// maximum Upload size for objects in a single operation
+	// 限制最大上传大小
 	if isMaxObjectSize(size) {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrEntityTooLarge), r.URL)
 		return
 	}
 
+	// 如果还有其他限制可以在这里添加
+	// 比如限制上传的文件类型, 文件名称...
+
+	// 获取元信息, 这里如果二次开发可以自定义许多内容 (放在 query 中)
 	metadata, err := extractMetadataFromReq(ctx, r)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -2043,6 +2060,7 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 	)
 
 	// Check if put is allowed
+	// 鉴权
 	if s3Err = isPutActionAllowed(ctx, rAuthType, bucket, object, r, policy.PutObjectAction); s3Err != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
 		return

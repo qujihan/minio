@@ -250,6 +250,7 @@ func s3APIMiddleware(f http.HandlerFunc, flags ...s3HFlag) http.HandlerFunc {
 }
 
 // registerAPIRouter - registers S3 compatible APIs.
+// S3 协议的路由注册
 func registerAPIRouter(router *mux.Router) {
 	// Initialize API.
 	api := objectAPIHandlers{
@@ -257,10 +258,13 @@ func registerAPIRouter(router *mux.Router) {
 	}
 
 	// API Router
+	// apiRouter 前缀被设置能 /
 	apiRouter := router.PathPrefix(SlashSeparator).Subrouter()
 
 	var routers []*mux.Router
+	// 遍历所以域名
 	for _, domainName := range globalDomainNames {
+		// k8s 环境下, 这里跳过
 		if IsKubernetes() {
 			routers = append(routers, apiRouter.MatcherFunc(func(r *http.Request, match *mux.RouteMatch) bool {
 				host, _, err := net.SplitHostPort(getHost(r))
@@ -281,11 +285,17 @@ func registerAPIRouter(router *mux.Router) {
 				return host != minioReservedBucket+"."+domainName
 			}).Host("{bucket:.+}."+domainName).Subrouter())
 		} else {
+			// 满足指定条件的域名, 添加到 routers 中
+			// 路径的样式大概是这个样子: bucket-name.s3.Region.amazonaws.com/key-name
 			routers = append(routers, apiRouter.Host("{bucket:.+}."+domainName).Subrouter())
 		}
 	}
+
+	// https: //s3.Region.amazonaws.com/bucket-name/key-name
+	// 还需要为上面的这种路径注册路由
 	routers = append(routers, apiRouter.PathPrefix("/{bucket}").Subrouter())
 
+	// 为每个 router 注册协议
 	for _, router := range routers {
 		// Register all rejected object APIs
 		for _, r := range rejectedObjAPIs {
@@ -367,6 +377,7 @@ func registerAPIRouter(router *mux.Router) {
 			HandlerFunc(s3APIMiddleware(api.GetObjectLambdaHandler, traceHdrsS3HFlag)).
 			Queries("lambdaArn", "{lambdaArn:.*}")
 		// GetObject
+		// 再看这里
 		router.Methods(http.MethodGet).Path("/{object:.+}").
 			HandlerFunc(s3APIMiddleware(api.GetObjectHandler, traceHdrsS3HFlag))
 		// CopyObject
@@ -388,6 +399,7 @@ func registerAPIRouter(router *mux.Router) {
 			HandlerFunc(s3APIMiddleware(api.PutObjectExtractHandler, traceHdrsS3HFlag))
 
 		// PutObject
+		// 先看这里
 		router.Methods(http.MethodPut).Path("/{object:.+}").
 			HandlerFunc(s3APIMiddleware(api.PutObjectHandler, traceHdrsS3HFlag))
 

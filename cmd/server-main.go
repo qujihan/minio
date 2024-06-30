@@ -738,6 +738,8 @@ func initializeLogRotate(ctx *cli.Context) (io.WriteCloser, error) {
 }
 
 // serverMain handler called for 'minio server' command.
+// server 的主函数
+// 源码的入口函数
 func serverMain(ctx *cli.Context) {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 
@@ -856,6 +858,7 @@ func serverMain(ctx *cli.Context) {
 	})
 
 	// Configure server.
+	// 注册服务器
 	bootstrapTrace("configureServer", func() {
 		handler, err := configureServerHandler(globalEndpoints)
 		if err != nil {

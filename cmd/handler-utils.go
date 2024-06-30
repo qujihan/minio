@@ -141,6 +141,9 @@ var userMetadataKeyPrefixes = []string{
 
 // extractMetadataFromReq extracts metadata from HTTP header and HTTP queryString.
 func extractMetadataFromReq(ctx context.Context, r *http.Request) (metadata map[string]string, err error) {
+	// textproto.MIMEHeader(r.Form), textproto.MIMEHeader(r.Header)
+	// 表示从 r.Form 和 r.Header 中提取元数据
+	// query and header
 	return extractMetadata(ctx, textproto.MIMEHeader(r.Form), textproto.MIMEHeader(r.Header))
 }
 
@@ -156,11 +159,15 @@ func extractMetadata(ctx context.Context, mimesHeader ...textproto.MIMEHeader) (
 	}
 
 	// Set content-type to default value if it is not set.
+	// 简单粗暴的设置 content-type
+	// 其实可以通过一些包来实现对 content-type 的解析
 	if _, ok := metadata[strings.ToLower(xhttp.ContentType)]; !ok {
 		metadata[strings.ToLower(xhttp.ContentType)] = "binary/octet-stream"
 	}
 
 	// https://github.com/google/security-research/security/advisories/GHSA-76wf-9vgp-pj7w
+	// 删除不需要的元信息
+	// 为啥需要删除?
 	for k := range metadata {
 		if equals(k, xhttp.AmzMetaUnencryptedContentLength, xhttp.AmzMetaUnencryptedContentMD5) {
 			delete(metadata, k)
