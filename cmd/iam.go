@@ -217,6 +217,9 @@ func (sys *IAMSys) Load(ctx context.Context, firstTime bool) error {
 
 	if firstTime {
 		bootstrapTraceMsg(fmt.Sprintf("globalIAMSys.Load(): (duration: %s)", loadDuration))
+		if globalIsDistErasure {
+			logger.Info("IAM load(startup) finished. (duration: %s)", loadDuration)
+		}
 	}
 
 	select {
@@ -400,12 +403,12 @@ func (sys *IAMSys) periodicRoutines(ctx context.Context, baseInterval time.Durat
 			// Load all IAM items (except STS creds) periodically.
 			refreshStart := time.Now()
 			if err := sys.Load(ctx, false); err != nil {
-				iamLogIf(ctx, fmt.Errorf("Failure in periodic refresh for IAM (took %.2fs): %v", time.Since(refreshStart).Seconds(), err), logger.WarningKind)
+				iamLogIf(ctx, fmt.Errorf("Failure in periodic refresh for IAM (duration: %s): %v", time.Since(refreshStart), err), logger.WarningKind)
 			} else {
 				took := time.Since(refreshStart).Seconds()
 				if took > maxDurationSecondsForLog {
 					// Log if we took a lot of time to load.
-					logger.Info("IAM refresh took %.2fs", took)
+					logger.Info("IAM refresh took (duration: %s)", took)
 				}
 			}
 
@@ -807,6 +810,57 @@ func (sys *IAMSys) ListLDAPUsers(ctx context.Context) (map[string]madmin.UserInf
 	}
 }
 
+type cleanEntitiesQuery struct {
+	Users    map[string]set.StringSet
+	Groups   set.StringSet
+	Policies set.StringSet
+}
+
+// createCleanEntitiesQuery - maps users to their groups and normalizes user or group DNs if ldap.
+func (sys *IAMSys) createCleanEntitiesQuery(q madmin.PolicyEntitiesQuery, ldap bool) cleanEntitiesQuery {
+	cleanQ := cleanEntitiesQuery{
+		Users:    make(map[string]set.StringSet),
+		Groups:   set.CreateStringSet(q.Groups...),
+		Policies: set.CreateStringSet(q.Policy...),
+	}
+
+	if ldap {
+		// Validate and normalize users, then fetch and normalize their groups
+		// Also include unvalidated users for backward compatibility.
+		for _, user := range q.Users {
+			lookupRes, actualGroups, _ := sys.LDAPConfig.GetValidatedDNWithGroups(user)
+			if lookupRes != nil {
+				groupSet := set.CreateStringSet(actualGroups...)
+
+				// duplicates can be overwritten, fetched groups should be identical.
+				cleanQ.Users[lookupRes.NormDN] = groupSet
+			}
+			// Search for non-normalized DN as well for backward compatibility.
+			if _, ok := cleanQ.Users[user]; !ok {
+				cleanQ.Users[user] = nil
+			}
+		}
+
+		// Validate and normalize groups.
+		for _, group := range q.Groups {
+			lookupRes, underDN, _ := sys.LDAPConfig.GetValidatedGroupDN(nil, group)
+			if lookupRes != nil && underDN {
+				cleanQ.Groups.Add(lookupRes.NormDN)
+			}
+		}
+	} else {
+		for _, user := range q.Users {
+			info, err := sys.store.GetUserInfo(user)
+			var groupSet set.StringSet
+			if err == nil {
+				groupSet = set.CreateStringSet(info.MemberOf...)
+			}
+			cleanQ.Users[user] = groupSet
+		}
+	}
+	return cleanQ
+}
+
 // QueryLDAPPolicyEntities - queries policy associations for LDAP users/groups/policies.
 func (sys *IAMSys) QueryLDAPPolicyEntities(ctx context.Context, q madmin.PolicyEntitiesQuery) (*madmin.PolicyEntitiesResult, error) {
 	if !sys.Initialized() {
@@ -819,7 +873,8 @@ func (sys *IAMSys) QueryLDAPPolicyEntities(ctx context.Context, q madmin.PolicyE
 
 	select {
 	case <-sys.configLoaded:
-		pe := sys.store.ListPolicyMappings(q, sys.LDAPConfig.IsLDAPUserDN, sys.LDAPConfig.IsLDAPGroupDN)
+		cleanQuery := sys.createCleanEntitiesQuery(q, true)
+		pe := sys.store.ListPolicyMappings(cleanQuery, sys.LDAPConfig.IsLDAPUserDN, sys.LDAPConfig.IsLDAPGroupDN, sys.LDAPConfig.DecodeDN)
 		pe.Timestamp = UTCNow()
 		return &pe, nil
 	case <-ctx.Done():
@@ -893,6 +948,7 @@ func (sys *IAMSys) QueryPolicyEntities(ctx context.Context, q madmin.PolicyEntit
 
 	select {
 	case <-sys.configLoaded:
+		cleanQuery := sys.createCleanEntitiesQuery(q, false)
 		var userPredicate, groupPredicate func(string) bool
 		if sys.LDAPConfig.Enabled() {
 			userPredicate = func(s string) bool {
@@ -902,7 +958,7 @@ func (sys *IAMSys) QueryPolicyEntities(ctx context.Context, q madmin.PolicyEntit
 				return !sys.LDAPConfig.IsLDAPGroupDN(s)
 			}
 		}
-		pe := sys.store.ListPolicyMappings(q, userPredicate, groupPredicate)
+		pe := sys.store.ListPolicyMappings(cleanQuery, userPredicate, groupPredicate, nil)
 		pe.Timestamp = UTCNow()
 		return &pe, nil
 	case <-ctx.Done():
@@ -1518,11 +1574,11 @@ func (sys *IAMSys) NormalizeLDAPAccessKeypairs(ctx context.Context, accessKeyMap
 		// server and is under a configured base DN.
 		validatedParent, isUnderBaseDN, err := sys.LDAPConfig.GetValidatedUserDN(conn, parent)
 		if err != nil {
-			collectedErrors = append(collectedErrors, fmt.Errorf("could not validate `%s` exists in LDAP directory: %w", parent, err))
+			collectedErrors = append(collectedErrors, fmt.Errorf("could not validate parent exists in LDAP directory: %w", err))
 			continue
 		}
 		if validatedParent == nil || !isUnderBaseDN {
-			err := fmt.Errorf("DN `%s` was not found in the LDAP directory", parent)
+			err := fmt.Errorf("DN parent was not found in the LDAP directory")
 			collectedErrors = append(collectedErrors, err)
 			continue
 		}
@@ -1537,11 +1593,11 @@ func (sys *IAMSys) NormalizeLDAPAccessKeypairs(ctx context.Context, accessKeyMap
 			// configured base DN.
 			validatedGroup, _, err := sys.LDAPConfig.GetValidatedGroupDN(conn, group)
 			if err != nil {
-				collectedErrors = append(collectedErrors, fmt.Errorf("could not validate `%s` exists in LDAP directory: %w", group, err))
+				collectedErrors = append(collectedErrors, fmt.Errorf("could not validate group exists in LDAP directory: %w", err))
 				continue
 			}
 			if validatedGroup == nil {
-				err := fmt.Errorf("DN `%s` was not found in the LDAP directory", group)
+				err := fmt.Errorf("DN group was not found in the LDAP directory")
 				collectedErrors = append(collectedErrors, err)
 				continue
 			}
@@ -1631,7 +1687,7 @@ func (sys *IAMSys) NormalizeLDAPMappingImport(ctx context.Context, isGroup bool,
 			continue
 		}
 		if validatedDN == nil || !underBaseDN {
-			err := fmt.Errorf("DN `%s` was not found in the LDAP directory", k)
+			err := fmt.Errorf("DN was not found in the LDAP directory")
 			collectedErrors = append(collectedErrors, err)
 			continue
 		}
@@ -1974,7 +2030,7 @@ func (sys *IAMSys) PolicyDBUpdateLDAP(ctx context.Context, isAttach bool,
 		if dnResult == nil {
 			// dn not found - still attempt to detach if provided user is a DN.
 			if !isAttach && sys.LDAPConfig.IsLDAPUserDN(r.User) {
-				dn = r.User
+				dn = sys.LDAPConfig.QuickNormalizeDN(r.User)
 			} else {
 				err = errNoSuchUser
 				return
@@ -1991,7 +2047,7 @@ func (sys *IAMSys) PolicyDBUpdateLDAP(ctx context.Context, isAttach bool,
 		}
 		if dnResult == nil || !underBaseDN {
 			if !isAttach {
-				dn = r.Group
+				dn = sys.LDAPConfig.QuickNormalizeDN(r.Group)
 			} else {
 				err = errNoSuchGroup
 				return
